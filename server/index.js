@@ -12,6 +12,8 @@ const dataDir = path.join(__dirname, "..", "data");
 fs.mkdirSync(dataDir, { recursive: true });
 const imageDir = path.join(dataDir, "product-images");
 fs.mkdirSync(imageDir, { recursive: true });
+const MANAGER_TOKEN = String(process.env.POS_MANAGER_TOKEN || "");
+const APP_VERSION = (() => { try { return JSON.parse(fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf8")).version || "unknown"; } catch { return "unknown"; } })();
 
 let db = new Database(path.join(dataDir, "pos.sqlite"));
 db.pragma("journal_mode = WAL");
@@ -50,6 +52,35 @@ db.exec(`
     description TEXT NOT NULL,
     amount REAL NOT NULL CHECK (amount >= 0),
     created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+  );
+
+  CREATE TABLE IF NOT EXISTS supplier_debts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    supplier_name TEXT NOT NULL,
+    debt_date TEXT NOT NULL,
+    notes TEXT NOT NULL DEFAULT '',
+    total_amount REAL NOT NULL DEFAULT 0 CHECK (total_amount >= 0),
+    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+  );
+
+  CREATE TABLE IF NOT EXISTS supplier_debt_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    debt_id INTEGER NOT NULL,
+    description TEXT NOT NULL,
+    cost REAL NOT NULL CHECK (cost >= 0),
+    quantity TEXT NOT NULL DEFAULT '1',
+    FOREIGN KEY (debt_id) REFERENCES supplier_debts(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS supplier_debt_payments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    debt_id INTEGER NOT NULL,
+    payment_date TEXT NOT NULL,
+    amount REAL NOT NULL CHECK (amount > 0),
+    notes TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+    FOREIGN KEY (debt_id) REFERENCES supplier_debts(id) ON DELETE CASCADE
   );
 
   CREATE TABLE IF NOT EXISTS transactions (
@@ -148,6 +179,8 @@ db.exec(`
   );
 `);
 
+db.exec(`CREATE INDEX IF NOT EXISTS idx_supplier_debts_date ON supplier_debts(debt_date); CREATE INDEX IF NOT EXISTS idx_supplier_debts_supplier ON supplier_debts(supplier_name); CREATE INDEX IF NOT EXISTS idx_supplier_debt_payments_debt ON supplier_debt_payments(debt_id);`);
+
 const productColumns = db.prepare("PRAGMA table_info(products)").all();
 if (!productColumns.some(c => c.name === "image_data")) {
   db.exec("ALTER TABLE products ADD COLUMN image_data TEXT");
@@ -158,6 +191,36 @@ if (!productColumns.some(c => c.name === "deleted_at")) {
 if (!productColumns.some(c => c.name === "cost_price")) {
   db.exec("ALTER TABLE products ADD COLUMN cost_price REAL NOT NULL DEFAULT 0");
 }
+const supplierDebtItemColumns = db.prepare("PRAGMA table_info(supplier_debt_items)").all();
+if (!supplierDebtItemColumns.some(c => c.name === "quantity")) {
+  db.exec("ALTER TABLE supplier_debt_items ADD COLUMN quantity TEXT NOT NULL DEFAULT '1'");
+} else {
+  const quantityColumn = supplierDebtItemColumns.find(c => c.name === "quantity");
+  // v4.9.6 stored quantity as a numeric field with a positive-value CHECK.
+  // Debt quantities are descriptive (e.g. "1 crate", "10 boxes"), so migrate
+  // the column to unrestricted text while preserving every existing value.
+  if (String(quantityColumn.type || "").toUpperCase() !== "TEXT") {
+    db.exec(`
+      PRAGMA foreign_keys = OFF;
+      BEGIN;
+      CREATE TABLE supplier_debt_items__text (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        debt_id INTEGER NOT NULL,
+        description TEXT NOT NULL,
+        cost REAL NOT NULL CHECK (cost >= 0),
+        quantity TEXT NOT NULL DEFAULT '1',
+        FOREIGN KEY (debt_id) REFERENCES supplier_debts(id) ON DELETE CASCADE
+      );
+      INSERT INTO supplier_debt_items__text (id, debt_id, description, cost, quantity)
+        SELECT id, debt_id, description, cost, CAST(quantity AS TEXT) FROM supplier_debt_items;
+      DROP TABLE supplier_debt_items;
+      ALTER TABLE supplier_debt_items__text RENAME TO supplier_debt_items;
+      COMMIT;
+      PRAGMA foreign_keys = ON;
+    `);
+  }
+}
+
 if (!productColumns.some(c => c.name === "barcode")) {
   db.exec("ALTER TABLE products ADD COLUMN barcode TEXT");
 }
@@ -245,7 +308,7 @@ if (!db.prepare("SELECT id FROM receipt_settings WHERE id=1").get()) db.prepare(
 const activeAdminTokens = new Map();
 const activeCashierTokens = new Map();
 const DEFAULT_ADMIN_TIMEOUT_MINUTES = 15;
-const ALLOWED_ADMIN_TIMEOUTS = [5, 10, 15, 30];
+const ALLOWED_ADMIN_TIMEOUTS = [0, 5, 10, 15, 30];
 
 function normalizePasscode(value) {
   return String(value ?? "").trim();
@@ -273,7 +336,8 @@ function verifySecret(secret, salt, storedHash) {
 
 function adminSettings() {
   const row = db.prepare("SELECT session_timeout_minutes AS sessionTimeoutMinutes, recovery_hash AS recoveryHash FROM admin_auth WHERE id=1").get();
-  const timeout = Number(row?.sessionTimeoutMinutes) || DEFAULT_ADMIN_TIMEOUT_MINUTES;
+  const rawTimeout = row?.sessionTimeoutMinutes;
+  const timeout = rawTimeout === null || rawTimeout === undefined ? DEFAULT_ADMIN_TIMEOUT_MINUTES : Number(rawTimeout);
   return { sessionTimeoutMinutes: ALLOWED_ADMIN_TIMEOUTS.includes(timeout) ? timeout : DEFAULT_ADMIN_TIMEOUT_MINUTES, hasRecoveryCode: Boolean(row?.recoveryHash) };
 }
 
@@ -287,13 +351,22 @@ function isAdminAuthorized(request) {
   const token = String(request.headers["x-admin-token"] || "");
   if (!token) return false;
   const lastUsed = activeAdminTokens.get(token);
-  const timeoutMs = adminSettings().sessionTimeoutMinutes * 60 * 1000;
+  const timeoutMinutes = adminSettings().sessionTimeoutMinutes;
+  if (timeoutMinutes === 0) {
+    activeAdminTokens.set(token, Date.now());
+    return true;
+  }
+  const timeoutMs = timeoutMinutes * 60 * 1000;
   if (!lastUsed || Date.now() - lastUsed > timeoutMs) {
     activeAdminTokens.delete(token);
     return false;
   }
   activeAdminTokens.set(token, Date.now());
   return true;
+}
+
+function isManagerAuthorized(request) {
+  return Boolean(MANAGER_TOKEN) && String(request.headers["x-manager-token"] || "") === MANAGER_TOKEN;
 }
 
 function requireAdmin(request, reply) {
@@ -578,9 +651,9 @@ app.get("/api/auth/settings", async (request, reply) => {
 app.put("/api/auth/settings", async (request, reply) => {
   if (!requireAdmin(request, reply)) return;
   const timeout = Number(request.body?.sessionTimeoutMinutes);
-  if (!ALLOWED_ADMIN_TIMEOUTS.includes(timeout)) return reply.code(400).send({ error: "Session timeout must be 5, 10, 15 or 30 minutes." });
+  if (!ALLOWED_ADMIN_TIMEOUTS.includes(timeout)) return reply.code(400).send({ error: "Session timeout must be Never, 5, 10, 15 or 30 minutes." });
   db.prepare("UPDATE admin_auth SET session_timeout_minutes=? WHERE id=1").run(timeout);
-  writeAudit(request, 'Admin session timeout changed', `Set Owner/Admin session timeout to ${timeout} minutes.`);
+  writeAudit(request, 'Admin session timeout changed', timeout === 0 ? 'Set Owner/Admin session timeout to Never.' : `Set Owner/Admin session timeout to ${timeout} minutes.`);
   return adminSettings();
 });
 
@@ -823,7 +896,7 @@ app.get("/api/backup/database", async (request, reply) => {
 
     const manifest = {
       format: "Grocery POS Complete Backup",
-      version: "4.8.10",
+      version: APP_VERSION,
       createdAt: new Date().toISOString(),
       includes: ["pos.sqlite", "product-images/"]
     };
@@ -845,7 +918,8 @@ app.get("/api/backup/database", async (request, reply) => {
 });
 
 app.post("/api/backup/restore", async (request, reply) => {
-  if (!requireAdmin(request, reply)) return;
+  const managerAuthorized = isManagerAuthorized(request);
+  if (!managerAuthorized && !requireAdmin(request, reply)) return;
   const body = request.body;
   if (!Buffer.isBuffer(body) || !body.length) return reply.code(400).send({ error: "Please upload a valid Grocery POS backup file." });
   if (body.length > 300 * 1024 * 1024) return reply.code(413).send({ error: "Backup file is too large. Maximum size is 300 MB." });
@@ -890,7 +964,7 @@ app.post("/api/backup/restore", async (request, reply) => {
   try {
     fs.writeFileSync(tempPath, sqliteBuffer);
     source = new Database(tempPath, { readonly: true, fileMustExist: true });
-    const requiredTables = ["categories", "products", "expenses", "transactions", "transaction_items", "refunds", "admin_auth"];
+    const requiredTables = ["categories", "products", "expenses", "transactions", "transaction_items", "refunds"];
     const tableNames = new Set(source.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map(r => r.name));
     const missing = requiredTables.filter(name => !tableNames.has(name));
     if (missing.length) throw new Error(`This file is not a compatible Grocery POS backup. Missing: ${missing.join(", ")}.`);
@@ -913,30 +987,67 @@ app.post("/api/backup/restore", async (request, reply) => {
     db.prepare("ATTACH DATABASE ? AS restore_db").run(tempPath);
     attached = true;
 
-    const baseTables = ["categories", "products", "expenses", "transactions", "transaction_items", "refunds", "admin_auth"];
-    const optionalTables = ["store_settings", "receipt_settings", "cashier_accounts", "audit_logs"];
+    const baseTables = ["categories", "products", "expenses", "transactions", "transaction_items", "refunds"];
+    const optionalTables = ["store_settings", "receipt_settings", "cashier_accounts", "audit_logs", "supplier_debts", "supplier_debt_items", "supplier_debt_payments"];
     const backupTableNames = tableNames;
     const tables = [...baseTables, ...optionalTables.filter(name => backupTableNames.has(name))];
-    const transaction = db.transaction(() => {
-      for (const table of tables.slice().reverse()) db.exec(`DELETE FROM ${table}`);
-      for (const table of tables) {
-        const mainCols = db.prepare(`PRAGMA table_info(${table})`).all().map(c => c.name);
-        const backupCols = db.prepare(`PRAGMA restore_db.table_info(${table})`).all().map(c => c.name);
-        let cols = mainCols;
-        if (table === "transactions") {
-          const missingRequired = ["id","transaction_number","subtotal","discount","total","cash_received","change_amount","refunded_at","refund_reason","refund_status","refunded_amount","refunded_subtotal","created_at"].filter(c => !backupCols.includes(c));
-          if (missingRequired.length) throw new Error(`The backup schema for ${table} is missing required fields: ${missingRequired.join(", ")}.`);
-          cols = mainCols.filter(c => backupCols.includes(c));
-        } else if (mainCols.length !== backupCols.length || mainCols.some((c, i) => c !== backupCols[i])) {
-          throw new Error(`The backup schema for ${table} does not match this POS version.`);
+    const allowSchemaMismatch = String(request.headers["x-allow-schema-mismatch"] || "").toLowerCase() === "true";
+    const rejectRestore = (status, payload) => {
+      try { if (attached) db.exec("DETACH DATABASE restore_db"); } catch {}
+      attached = false;
+      return reply.code(status).send(payload);
+    };
+    const restorePlans = [];
+    const schemaMismatches = [];
+    for (const table of tables) {
+      const mainInfo = db.prepare(`PRAGMA table_info(${table})`).all();
+      const backupInfo = db.prepare(`PRAGMA restore_db.table_info(${table})`).all();
+      const mainCols = mainInfo.map(c => c.name);
+      const backupCols = backupInfo.map(c => c.name);
+      const missingInBackup = mainCols.filter(c => !backupCols.includes(c));
+      const extraInBackup = backupCols.filter(c => !mainCols.includes(c));
+      let cols = mainCols.filter(c => backupCols.includes(c));
+      if (table === "transactions") {
+        const missingRequired = ["id","transaction_number","subtotal","discount","total","cash_received","change_amount","refunded_at","refund_reason","refund_status","refunded_amount","refunded_subtotal","created_at"].filter(c => !backupCols.includes(c));
+        if (missingRequired.length) {
+          return rejectRestore(400, { error: `The backup schema for ${table} is missing required fields: ${missingRequired.join(", ")}.`, code: "REQUIRED_SCHEMA_MISSING" });
         }
+      }
+      const missingNonDefaultRequired = mainInfo
+        .filter(c => c.notnull && !c.pk && c.dflt_value === null && !backupCols.includes(c.name))
+        .map(c => c.name);
+      if (missingNonDefaultRequired.length) {
+        return rejectRestore(400, { error: `The backup schema for ${table} is missing required fields that cannot be safely filled: ${missingNonDefaultRequired.join(", ")}.`, code: "REQUIRED_SCHEMA_MISSING" });
+      }
+      if (missingInBackup.length || extraInBackup.length || mainCols.length !== backupCols.length) {
+        schemaMismatches.push({ table, missingInBackup, extraInBackup });
+      }
+      if (!cols.length) return rejectRestore(400, { error: `The backup contains no compatible fields for ${table}.`, code: "NO_COMPATIBLE_COLUMNS" });
+      restorePlans.push({ table, cols });
+    }
+    if (schemaMismatches.length && !allowSchemaMismatch) {
+      return rejectRestore(409, {
+        error: "The backup schema differs from the current POS version. You can continue after confirming that you want to restore it anyway.",
+        code: "SCHEMA_MISMATCH",
+        warning: "Only compatible columns will be restored. Newer columns in this POS will keep their default values. Columns that exist only in the backup will be ignored.",
+        mismatches: schemaMismatches
+      });
+    }
+    const transaction = db.transaction(() => {
+      // Security credentials are machine-local. Never replace the destination
+      // admin_auth row when restoring business data from another machine.
+      for (const table of tables.slice().reverse()) db.exec(`DELETE FROM ${table}`);
+      for (const { table, cols } of restorePlans) {
         const quotedCols = cols.map(c => `"${c.replace(/"/g, '""')}"`).join(", ");
         db.exec(`INSERT INTO ${table} (${quotedCols}) SELECT ${quotedCols} FROM restore_db.${table}`);
       }
       try { db.exec("DELETE FROM sqlite_sequence"); } catch {}
       for (const table of baseTables) {
         const maxId = db.prepare(`SELECT MAX(id) AS maxId FROM ${table}`).get().maxId;
-        if (maxId != null) db.prepare("INSERT INTO sqlite_sequence(name, seq) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET seq=excluded.seq").run(table, maxId);
+        if (maxId != null) {
+          const updated = db.prepare("UPDATE sqlite_sequence SET seq=? WHERE name=?").run(maxId, table);
+          if (updated.changes === 0) db.prepare("INSERT INTO sqlite_sequence(name, seq) VALUES (?, ?)").run(table, maxId);
+        }
       }
     });
     transaction();
@@ -1696,6 +1807,115 @@ app.get("/api/staff-performance", async (request, reply) => {
     selectedMetrics: selected ? metricFor(selected) : null,
     transactions: transactions.map(x=>({...x,subtotal:Number(x.subtotal),discount:Number(x.discount),total:Number(x.total),cashReceived:Number(x.cashReceived),changeAmount:Number(x.changeAmount),refundedAmount:Number(x.refundedAmount),netSales:Number(x.netSales)})),
     total, page, limit, totalPages: Math.max(1, Math.ceil(total/limit)) };
+});
+
+function debtStatus(total, paid) {
+  const t = Number(total) || 0, p = Number(paid) || 0;
+  if (p >= t - 0.005) return "paid";
+  if (p > 0) return "partial";
+  return "unpaid";
+}
+
+function debtSummaryRow(row) {
+  const total = Number(row.totalAmount) || 0;
+  const paid = Number(row.paidAmount) || 0;
+  return { ...row, totalAmount: total, paidAmount: paid, balance: Math.max(0, total - paid), status: debtStatus(total, paid) };
+}
+
+app.get("/api/debts", async (request, reply) => {
+  if (!requireAdmin(request, reply)) return;
+  const status = String(request.query?.status || "all").toLowerCase();
+  const supplier = String(request.query?.supplier || "").trim();
+  const q = String(request.query?.q || "").trim();
+  const page = Math.max(Number(request.query?.page) || 1, 1);
+  const limit = Math.min(Math.max(Number(request.query?.limit) || 25, 1), 100);
+  const rows = db.prepare(`
+    SELECT d.id, d.supplier_name AS supplierName, d.debt_date AS debtDate, d.notes,
+           d.total_amount AS totalAmount, d.created_at AS createdAt, d.updated_at AS updatedAt,
+           COALESCE((SELECT SUM(p.amount) FROM supplier_debt_payments p WHERE p.debt_id=d.id),0) AS paidAmount
+    FROM supplier_debts d
+    WHERE (?='' OR d.supplier_name LIKE '%' || ? || '%')
+      AND (?='' OR d.supplier_name LIKE '%' || ? || '%' OR d.notes LIKE '%' || ? || '%' OR EXISTS (SELECT 1 FROM supplier_debt_items di WHERE di.debt_id=d.id AND di.description LIKE '%' || ? || '%'))
+    ORDER BY d.debt_date DESC, d.id DESC
+  `).all(supplier, supplier, q, q, q, q).map(debtSummaryRow);
+  const filtered = rows.filter(r => status === "all" || r.status === status);
+  const total = filtered.length;
+  const items = filtered.slice((page-1)*limit, page*limit);
+  const totals = rows.reduce((a,r) => { a.total += r.totalAmount; a.paid += r.paidAmount; a.balance += r.balance; return a; }, {total:0,paid:0,balance:0});
+  const suppliers = db.prepare("SELECT DISTINCT supplier_name AS name FROM supplier_debts ORDER BY supplier_name COLLATE NOCASE").all();
+  return { items, total, page, limit, totalPages: Math.max(1, Math.ceil(total/limit)), totals, suppliers };
+});
+
+app.get("/api/debts/:id", async (request, reply) => {
+  if (!requireAdmin(request, reply)) return;
+  const id = Number(request.params.id);
+  if (!Number.isInteger(id) || id < 1) return reply.code(400).send({ error: "Invalid debt." });
+  const row = db.prepare(`SELECT d.id, d.supplier_name AS supplierName, d.debt_date AS debtDate, d.notes, d.total_amount AS totalAmount, d.created_at AS createdAt, d.updated_at AS updatedAt, COALESCE((SELECT SUM(p.amount) FROM supplier_debt_payments p WHERE p.debt_id=d.id),0) AS paidAmount FROM supplier_debts d WHERE d.id=?`).get(id);
+  if (!row) return reply.code(404).send({ error: "Debt record not found." });
+  const items = db.prepare("SELECT id, description, cost, quantity FROM supplier_debt_items WHERE debt_id=? ORDER BY id").all(id).map(x => ({...x, cost:Number(x.cost), quantity:String(x.quantity ?? "1")}));
+  const payments = db.prepare("SELECT id, payment_date AS paymentDate, amount, notes, created_at AS createdAt FROM supplier_debt_payments WHERE debt_id=? ORDER BY payment_date ASC, id ASC").all(id).map(x => ({...x, amount:Number(x.amount)}));
+  return { ...debtSummaryRow(row), items, payments };
+});
+
+app.post("/api/debts", async (request, reply) => {
+  if (!requireAdmin(request, reply)) return;
+  const b=request.body||{}; const supplier=String(b.supplierName||"").trim(); const date=String(b.debtDate||"").trim(); const notes=String(b.notes||"").trim();
+  const items=Array.isArray(b.items)?b.items:[];
+  if (!supplier || supplier.length>120) return reply.code(400).send({error:"Supplier name is required and must be 120 characters or fewer."});
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return reply.code(400).send({error:"A valid debt date is required."});
+  if (notes.length>500) return reply.code(400).send({error:"Notes must be 500 characters or fewer."});
+  const clean=items.map(x=>({rawQuantity:String(x.quantity??"").trim(),rawDescription:String(x.description??"").trim(),rawCost:String(x.cost??"").trim()})).filter(x=>x.rawQuantity!==""||x.rawDescription!==""||x.rawCost!=="").map(x=>({quantity:x.rawQuantity,description:x.rawDescription,cost:Number(x.rawCost)}));
+  if (!clean.length) return reply.code(400).send({error:"Add at least one supply line."});
+  if (clean.some(x=>!x.quantity || x.quantity.length>80 || !x.description || !Number.isFinite(x.cost) || x.cost<0)) return reply.code(400).send({error:"Every supply must have a quantity, a description and a valid non-negative cost."});
+  const total=clean.reduce((s,x)=>s+x.cost,0);
+  if (!(total>0)) return reply.code(400).send({error:"The debt total must be greater than zero."});
+  const tx=db.transaction(()=>{ const r=db.prepare("INSERT INTO supplier_debts (supplier_name,debt_date,notes,total_amount) VALUES (?,?,?,?)").run(supplier,date,notes,total); const id=Number(r.lastInsertRowid); const ins=db.prepare("INSERT INTO supplier_debt_items (debt_id,description,cost,quantity) VALUES (?,?,?,?)"); clean.forEach(x=>ins.run(id,x.description,x.cost,x.quantity)); return id; });
+  const id=tx(); writeAudit(request,'Supplier debt created',`${supplier}: recorded supplier debt of ${total.toFixed(2)}.`,{}, {type:'owner',id:null,name:'Owner'});
+  return reply.code(201).send({id,supplierName:supplier,debtDate:date,notes,totalAmount:total,paidAmount:0,balance:total,status:'unpaid',items:clean.map((x,i)=>({id:i+1,...x})),payments:[]});
+});
+
+app.put("/api/debts/:id", async (request, reply) => {
+  if (!requireAdmin(request, reply)) return;
+  const id=Number(request.params.id); if(!Number.isInteger(id)||id<1)return reply.code(400).send({error:"Invalid debt."});
+  const existing=db.prepare("SELECT id FROM supplier_debts WHERE id=?").get(id); if(!existing)return reply.code(404).send({error:"Debt record not found."});
+  const b=request.body||{}; const supplier=String(b.supplierName||"").trim(); const date=String(b.debtDate||"").trim(); const notes=String(b.notes||"").trim(); const items=Array.isArray(b.items)?b.items:[];
+  if(!supplier||supplier.length>120)return reply.code(400).send({error:"Supplier name is required and must be 120 characters or fewer."});
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(date))return reply.code(400).send({error:"A valid debt date is required."});
+  if(notes.length>500)return reply.code(400).send({error:"Notes must be 500 characters or fewer."});
+  const clean=items.map(x=>({rawQuantity:String(x.quantity??"").trim(),rawDescription:String(x.description??"").trim(),rawCost:String(x.cost??"").trim()})).filter(x=>x.rawQuantity!==""||x.rawDescription!==""||x.rawCost!=="").map(x=>({quantity:x.rawQuantity,description:x.rawDescription,cost:Number(x.rawCost)}));
+  if(!clean.length||clean.some(x=>!x.quantity || x.quantity.length>80 || !x.description || !Number.isFinite(x.cost) || x.cost<0))return reply.code(400).send({error:"Every debt must have at least one valid supply line with quantity, description and cost."});
+  const total=clean.reduce((s,x)=>s+x.cost,0); if(!(total>0))return reply.code(400).send({error:"The debt total must be greater than zero."});
+  const paid=Number(db.prepare("SELECT COALESCE(SUM(amount),0) AS paid FROM supplier_debt_payments WHERE debt_id=?").get(id).paid); if(total+0.005<paid)return reply.code(400).send({error:`The new debt total cannot be less than payments already recorded (${paid.toFixed(2)}).`});
+  const tx=db.transaction(()=>{db.prepare("UPDATE supplier_debts SET supplier_name=?,debt_date=?,notes=?,total_amount=?,updated_at=datetime('now','localtime') WHERE id=?").run(supplier,date,notes,total,id);db.prepare("DELETE FROM supplier_debt_items WHERE debt_id=?").run(id);const ins=db.prepare("INSERT INTO supplier_debt_items (debt_id,description,cost,quantity) VALUES (?,?,?,?)");clean.forEach(x=>ins.run(id,x.description,x.cost,x.quantity));}); tx();
+  writeAudit(request,'Supplier debt updated',`${supplier}: updated supplier debt #${id}.`);
+  const row=db.prepare(`SELECT d.id,d.supplier_name AS supplierName,d.debt_date AS debtDate,d.notes,d.total_amount AS totalAmount,d.created_at AS createdAt,d.updated_at AS updatedAt,COALESCE((SELECT SUM(p.amount) FROM supplier_debt_payments p WHERE p.debt_id=d.id),0) AS paidAmount FROM supplier_debts d WHERE d.id=?`).get(id); const fullItems=db.prepare("SELECT id,description,cost,quantity FROM supplier_debt_items WHERE debt_id=? ORDER BY id").all(id).map(x=>({...x,cost:Number(x.cost),quantity:String(x.quantity ?? "1")})); const fullPayments=db.prepare("SELECT id,payment_date AS paymentDate,amount,notes,created_at AS createdAt FROM supplier_debt_payments WHERE debt_id=? ORDER BY payment_date ASC,id ASC").all(id).map(x=>({...x,amount:Number(x.amount)})); return {...debtSummaryRow(row),items:fullItems,payments:fullPayments};
+});
+
+app.delete("/api/debts/:id", async (request, reply) => {
+  if (!requireAdmin(request, reply)) return;
+  const id=Number(request.params.id); if(!Number.isInteger(id)||id<1)return reply.code(400).send({error:"Invalid debt."});
+  const row=db.prepare("SELECT supplier_name AS supplierName,total_amount AS totalAmount FROM supplier_debts WHERE id=?").get(id); if(!row)return reply.code(404).send({error:"Debt record not found."});
+  const paymentCount=Number(db.prepare("SELECT COUNT(*) AS count FROM supplier_debt_payments WHERE debt_id=?").get(id).count); if(paymentCount>0)return reply.code(409).send({error:"This debt has payment history. Remove or correct the payments before deleting the debt."});
+  db.prepare("DELETE FROM supplier_debts WHERE id=?").run(id); writeAudit(request,'Supplier debt deleted',`${row.supplierName}: deleted supplier debt #${id}.`); return {ok:true};
+});
+
+app.post("/api/debts/:id/payments", async (request, reply) => {
+  if (!requireAdmin(request, reply)) return;
+  const id=Number(request.params.id); if(!Number.isInteger(id)||id<1)return reply.code(400).send({error:"Invalid debt."});
+  const debt=db.prepare("SELECT supplier_name AS supplierName,total_amount AS totalAmount FROM supplier_debts WHERE id=?").get(id); if(!debt)return reply.code(404).send({error:"Debt record not found."});
+  const b=request.body||{}; const date=String(b.paymentDate||"").trim(); const amount=Number(b.amount); const notes=String(b.notes||"").trim();
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(date)||!Number.isFinite(amount)||amount<=0)return reply.code(400).send({error:"Payment date and a valid payment amount are required."});
+  if(notes.length>300)return reply.code(400).send({error:"Payment notes must be 300 characters or fewer."});
+  const paid=Number(db.prepare("SELECT COALESCE(SUM(amount),0) AS paid FROM supplier_debt_payments WHERE debt_id=?").get(id).paid); const balance=Number(debt.totalAmount)-paid;
+  if(amount>balance+0.005)return reply.code(400).send({error:`Payment cannot exceed the remaining balance of ${balance.toFixed(2)}.`});
+  const r=db.prepare("INSERT INTO supplier_debt_payments (debt_id,payment_date,amount,notes) VALUES (?,?,?,?)").run(id,date,amount,notes); db.prepare("UPDATE supplier_debts SET updated_at=datetime('now','localtime') WHERE id=?").run(id); writeAudit(request,'Supplier debt payment recorded',`${debt.supplierName}: recorded supplier payment of ${amount.toFixed(2)} on ${date}.`); return reply.code(201).send({id:Number(r.lastInsertRowid),debtId:id,paymentDate:date,amount,notes});
+});
+
+app.delete("/api/debts/:debtId/payments/:paymentId", async (request, reply) => {
+  if (!requireAdmin(request, reply)) return;
+  const debtId=Number(request.params.debtId), paymentId=Number(request.params.paymentId); if(!Number.isInteger(debtId)||!Number.isInteger(paymentId))return reply.code(400).send({error:"Invalid payment."});
+  const row=db.prepare("SELECT p.id,p.amount,d.supplier_name AS supplierName FROM supplier_debt_payments p JOIN supplier_debts d ON d.id=p.debt_id WHERE p.id=? AND p.debt_id=?").get(paymentId,debtId); if(!row)return reply.code(404).send({error:"Payment not found."});
+  db.prepare("DELETE FROM supplier_debt_payments WHERE id=?").run(paymentId); db.prepare("UPDATE supplier_debts SET updated_at=datetime('now','localtime') WHERE id=?").run(debtId); writeAudit(request,'Supplier debt payment deleted',`${row.supplierName}: deleted supplier payment of ${Number(row.amount).toFixed(2)}.`); return {ok:true};
 });
 
 app.post("/api/expenses", async (request, reply) => {

@@ -629,7 +629,82 @@ function AuditLog({ data, loading, filters, onFiltersChange, onRefresh, onHome, 
   </main>;
 }
 
-function OwnerMenu({ onProducts, onDashboard, onReports, onSettings, onStaff, onAudit, onLock, onHome, storeInfo }) {
+function DebtTracker({ data, loading, filters, onFiltersChange, onRefresh, onHome, onSaveDebt, onDeleteDebt, onSavePayment, onDeletePayment, storeInfo, adminToken }) {
+  const today = new Date(); const pad=n=>String(n).padStart(2,'0'); const todayISO=`${today.getFullYear()}-${pad(today.getMonth()+1)}-${pad(today.getDate())}`;
+  const [formOpen,setFormOpen]=useState(false), [editing,setEditing]=useState(null), [detail,setDetail]=useState(null), [paymentOpen,setPaymentOpen]=useState(false), [busy,setBusy]=useState(false), [error,setError]=useState(""), [confirm,setConfirm]=useState(null);
+  const emptyForm=()=>({supplierName:"",debtDate:todayISO,notes:"",items:[{quantity:"",description:"",cost:""}]});
+  const openNew=()=>{setEditing(emptyForm());setFormOpen(true);setError("");};
+  const openEdit=async item=>{setError("");try{const full=await api(`/api/debts/${item.id}`,{},adminToken||"");setEditing({id:full.id,supplierName:full.supplierName,debtDate:full.debtDate,notes:full.notes||"",items:full.items.map(x=>({id:x.id,quantity:String(x.quantity ?? 1),description:x.description,cost:String(x.cost)}))});setFormOpen(true);}catch(e){setError(e.message);}};
+  const submitDebt=async e=>{e.preventDefault();setBusy(true);setError("");try{const cleanedItems=(editing.items||[]).filter(item=>String(item.quantity??"").trim()!==""||String(item.description??"").trim()!==""||String(item.cost??"").trim()!=="");const cleanedForm={...editing,items:cleanedItems};setEditing(cleanedForm);const saved=await onSaveDebt(cleanedForm);setFormOpen(false);setEditing(null);await onRefresh();if(saved?.id){const full=await api(`/api/debts/${saved.id}`,{},adminToken||"");setDetail(full);}}catch(e){setError(e.message);}finally{setBusy(false);}};
+  const openDetail=async item=>{setError("");try{setDetail(await api(`/api/debts/${item.id}`,{},adminToken||""));}catch(e){setError(e.message);}};
+  const doDelete=item=>{setConfirm({title:"Delete Supplier Debt?",message:`Delete the debt from ${item.supplierName} for ${peso(item.totalAmount)}? This is only allowed when no payment history exists.`,confirmLabel:"Delete Debt",danger:true,onConfirm:async()=>{setBusy(true);try{await onDeleteDebt(item.id);setDetail(null);await onRefresh();setConfirm(null);}catch(e){setError(e.message);setConfirm(null);}finally{setBusy(false);}}});};
+  const statusLabel={unpaid:"Unpaid",partial:"Partially Paid",paid:"Paid"};
+  const visible=(data?.items||[]);
+  return <main className="simple-page debt-page">
+    <header className="topbar"><button className="back" onClick={onHome}><span className="back-arrow">←</span><span>Owner Center</span></button><div className="topbar-title"><BrandLogo storeInfo={storeInfo||null}/><div><b>Debt Tracker</b><small>Supplier deliveries and unpaid balances</small></div></div><button className="refresh" onClick={onRefresh}>↻ Refresh</button></header>
+    <div className="debt-wrap">
+      <div className="reports-head"><div><div className="eyebrow">OWNER / ADMIN</div><h2>Debt Tracker</h2><p>Record supplier deliveries, partial payments and remaining balances.</p></div><button className="primary small-btn" onClick={openNew}>＋ Add Supplier Debt</button></div>
+      <section className="debt-summary-grid"><div className="debt-summary-card"><span>Outstanding Debt</span><strong>{peso(data?.totals?.balance)}</strong></div><div className="debt-summary-card"><span>Total Recorded</span><strong>{peso(data?.totals?.total)}</strong></div><div className="debt-summary-card"><span>Total Paid</span><strong>{peso(data?.totals?.paid)}</strong></div></section>
+      <section className="dashboard-card debt-filter-card"><div className="debt-filter-row"><label><span>Status</span><select value={filters.status} onChange={e=>onFiltersChange({...filters,status:e.target.value,page:1})}><option value="all">All</option><option value="unpaid">Unpaid</option><option value="partial">Partially Paid</option><option value="paid">Paid</option></select></label><label><span>Supplier</span><select value={filters.supplier} onChange={e=>onFiltersChange({...filters,supplier:e.target.value,page:1})}><option value="">All suppliers</option>{(data?.suppliers||[]).map(x=><option key={x.name} value={x.name}>{x.name}</option>)}</select></label><label className="debt-search-field"><span>Search</span><input className="text-input" value={filters.q} onChange={e=>onFiltersChange({...filters,q:e.target.value,page:1})} placeholder="Supplier, supplies or notes..."/></label></div></section>
+      <section className="dashboard-card debt-list-card"><div className="card-head"><div><div className="eyebrow">SUPPLIER LEDGER</div><h3>{Number(data?.total||0).toLocaleString()} debt record{Number(data?.total||0)!==1?'s':''}</h3></div></div>{loading?<div className="loading">Loading supplier debts...</div>:visible.length?<div className="debt-table-wrap"><table className="report-table debt-table"><thead><tr><th>Date</th><th>Supplier</th><th>Supplies</th><th>Total</th><th>Paid</th><th>Balance</th><th>Status</th><th></th></tr></thead><tbody>{visible.map(item=><tr key={item.id} className="debt-row" onClick={()=>openDetail(item)}><td>{item.debtDate}</td><td><strong>{item.supplierName}</strong></td><td>{item.notes || "—"}</td><td>{peso(item.totalAmount)}</td><td>{peso(item.paidAmount)}</td><td><strong className={item.balance>0?"debt-balance":"debt-paid"}>{peso(item.balance)}</strong></td><td><span className={`debt-status debt-status-${item.status}`}>{statusLabel[item.status]}</span></td><td><button type="button" className="secondary small-btn" onClick={e=>{e.stopPropagation();openDetail(item)}}>View</button></td></tr>)}</tbody></table></div>:<div className="chart-empty">No supplier debts match these filters.</div>}{data?.totalPages>1&&<div className="pagination"><button className="secondary small-btn" disabled={data.page<=1} onClick={()=>onFiltersChange({...filters,page:data.page-1})}>← Previous</button><span>Page {data.page} of {data.totalPages}</span><button className="secondary small-btn" disabled={data.page>=data.totalPages} onClick={()=>onFiltersChange({...filters,page:data.page+1})}>Next →</button></div>}</section>
+    </div>
+    {formOpen&&editing&&<DebtFormModal form={editing} setForm={setEditing} busy={busy} error={error} onClose={()=>{if(!busy){setFormOpen(false);setEditing(null);}}} onSubmit={submitDebt}/>} 
+    {detail&&<DebtDetailModal detail={detail} busy={busy} onClose={()=>setDetail(null)} onEdit={()=>{setDetail(null);openEdit(detail)}} onDelete={()=>doDelete(detail)} onPayment={()=>{setPaymentOpen(true);setError("")}} onDeletePayment={id=>setConfirm({title:"Delete Payment Record?",message:"Delete this payment record? The remaining balance will increase accordingly.",confirmLabel:"Delete Payment",danger:true,onConfirm:async()=>{setBusy(true);try{await onDeletePayment(detail.id,id);setDetail(await api(`/api/debts/${detail.id}`,{},adminToken||""));await onRefresh();setConfirm(null);}catch(e){setError(e.message);setConfirm(null);}finally{setBusy(false);}}})} error={error}/>} 
+    {paymentOpen&&detail&&<PaymentModal detail={detail} busy={busy} error={error} onClose={()=>{if(!busy)setPaymentOpen(false)}} onSubmit={async form=>{setBusy(true);setError("");try{await onSavePayment(detail.id,form);setPaymentOpen(false);setDetail(await api(`/api/debts/${detail.id}`,{},adminToken||""));await onRefresh();}catch(e){setError(e.message);}finally{setBusy(false);}}}/>}
+    {confirm&&<ConfirmModal title={confirm.title} message={confirm.message} confirmLabel={confirm.confirmLabel} busyLabel={confirm.confirmLabel?.replace(/^Delete /,"Deleting ")||"Working..."} onConfirm={confirm.onConfirm} onCancel={()=>{if(!busy)setConfirm(null)}} busy={busy}/>}
+  </main>;
+}
+
+function DebtFormModal({form,setForm,busy,error,onClose,onSubmit}){
+  const quantityRefs=useRef({});
+  const setItem=(i,key,value)=>setForm(f=>({...f,items:f.items.map((x,n)=>n===i?{...x,[key]:value}:x)}));
+  const total=form.items.reduce((s,x)=>s+(Number(x.cost)||0),0);
+  useEffect(()=>{
+    const first=quantityRefs.current[0];
+    if(first) setTimeout(()=>first.focus(),0);
+  },[]);
+  const addRowAfter=(i)=>{
+    const nextIndex=i+1;
+    setForm(f=>({...f,items:[...f.items.slice(0,nextIndex),{quantity:"",description:"",cost:""},...f.items.slice(nextIndex)]}));
+    setTimeout(()=>quantityRefs.current[nextIndex]?.focus(),0);
+  };
+  const handleCostKeyDown=(e,i)=>{
+    if(e.key!=='Enter') return;
+    e.preventDefault();
+    const item=form.items[i];
+    if(!String(item.quantity??"").trim() || !item.description.trim() || !(Number(item.cost)>=0)) return;
+    addRowAfter(i);
+  };
+  return <div className="modal-backdrop"><form className="modal debt-form-modal" onSubmit={onSubmit}>
+    <div className="modal-head"><div><div className="eyebrow">SUPPLIER DEBT</div><h2>{form.id?"Edit Supplier Debt":"Add Supplier Debt"}</h2><p>Record what was delivered and what you owe.</p></div><button type="button" className="icon-btn" onClick={onClose}>×</button></div>
+    <div className="form-two"><label><span className="label">Date</span><input className="text-input" type="date" value={form.debtDate} onChange={e=>setForm({...form,debtDate:e.target.value})} required/></label><label><span className="label">Supplier</span><input className="text-input" value={form.supplierName} onChange={e=>setForm({...form,supplierName:e.target.value})} placeholder="Supplier name" required/></label></div>
+    <div className="label debt-items-label">Supplies</div>
+    <div className="debt-item-editor">
+      <div className="debt-item-edit-row debt-item-edit-head"><span>Quantity</span><span>Supply</span><span>Cost</span><span></span></div>
+      {form.items.map((item,i)=><div className="debt-item-edit-row" key={i}>
+        <input ref={el=>{quantityRefs.current[i]=el}} className="text-input debt-qty-input" inputMode="text" value={item.quantity} onChange={e=>setItem(i,"quantity",e.target.value)} placeholder="e.g. 1 crate" aria-label={`Supply ${i+1} quantity`} />
+        <input className="text-input" value={item.description} onChange={e=>setItem(i,"description",e.target.value)} placeholder="Supply description" aria-label={`Supply ${i+1} description`} />
+        <input className="text-input debt-cost-input" inputMode="decimal" value={item.cost} onChange={e=>setItem(i,"cost",e.target.value)} onKeyDown={e=>handleCostKeyDown(e,i)} placeholder="Cost" aria-label={`Supply ${i+1} total cost`} />
+        <button type="button" tabIndex={-1} className="icon-btn debt-remove-line" disabled={form.items.length===1} onClick={()=>setForm(f=>({...f,items:f.items.filter((_,n)=>n!==i)}))} aria-label={`Remove supply ${i+1}`}>×</button>
+      </div>)}
+      <div className="debt-entry-hint">Tip: Quantity → Tab → Supply → Tab → Cost → Enter adds the next row and focuses Quantity.</div>
+    </div>
+    <label><span className="label">Notes <small>(optional)</small></span><textarea className="text-input debt-notes" value={form.notes} onChange={e=>setForm({...form,notes:e.target.value})} placeholder="Optional delivery notes..."/></label>
+    <div className="debt-total-box"><span>Total Debt</span><strong>{peso(total)}</strong></div>{error&&<div className="field-error">{error}</div>}
+    <div className="form-actions"><button type="button" className="secondary" onClick={onClose} disabled={busy}>Cancel</button><button type="submit" className="primary" disabled={busy||total<=0}>{busy?"Saving...":"Save Debt"}</button></div>
+  </form></div>;
+}
+function DebtDetailModal({detail,busy,onClose,onEdit,onDelete,onPayment,onDeletePayment,error}){
+  const status=detail.status; const label=status==='paid'?'Paid':status==='partial'?'Partially Paid':'Unpaid';
+  return <div className="modal-backdrop"><div className="modal debt-detail-modal"><div className="modal-head"><div><div className="eyebrow">SUPPLIER DEBT</div><h2>{detail.supplierName}</h2><p>{detail.debtDate} · <span className={`debt-status debt-status-${status}`}>{label}</span></p></div><button className="icon-btn" onClick={onClose}>×</button></div><div className="debt-detail-total"><div><span>Original Debt</span><strong>{peso(detail.totalAmount)}</strong></div><div><span>Total Paid</span><strong>{peso(detail.paidAmount)}</strong></div><div><span>Remaining</span><strong className={detail.balance>0?"debt-balance":"debt-paid"}>{peso(detail.balance)}</strong></div></div><section className="debt-detail-section"><div className="debt-section-head"><h3>Supplies Received</h3><span>{detail.items.length} line{detail.items.length!==1?'s':''}</span></div><div className="debt-lines">{detail.items.map(x=><div className="debt-line" key={x.id}><div className="debt-line-main"><strong className="debt-line-qty">{String(x.quantity ?? "1")}</strong><span>{x.description}</span></div><strong>{peso(x.cost)}</strong></div>)}</div>{detail.notes&&<div className="debt-note"><strong>Notes:</strong> {detail.notes}</div>}</section><section className="debt-detail-section"><div className="debt-section-head"><h3>Payment History</h3><button className="primary small-btn" onClick={onPayment} disabled={detail.balance<=0}>＋ Record Payment</button></div>{detail.payments.length?<div className="debt-lines">{detail.payments.map(x=><div className="debt-line" key={x.id}><div><strong>{x.paymentDate}</strong>{x.notes&&<small>{x.notes}</small>}</div><div className="debt-payment-right"><strong>{peso(x.amount)}</strong><button className="icon-btn mini-delete" disabled={busy} onClick={()=>onDeletePayment(x.id)}>×</button></div></div>)}</div>:<div className="chart-empty debt-empty">No payments recorded yet.</div>}</section>{error&&<div className="field-error">{error}</div>}<div className="form-actions"><button className="secondary" onClick={onEdit} disabled={busy}>Edit Debt</button><button className="danger" onClick={onDelete} disabled={busy||detail.payments.length>0}>Delete</button><button className="primary" onClick={onClose}>Done</button></div></div></div>;
+}
+
+function PaymentModal({detail,busy,error,onClose,onSubmit}){
+  const d=new Date(), pad=n=>String(n).padStart(2,'0'); const today=`${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`; const [form,setForm]=useState({paymentDate:today,amount:"",notes:""});
+  return <div className="modal-backdrop"><form className="modal payment-modal" onSubmit={e=>{e.preventDefault();onSubmit(form)}}><div className="modal-head"><div><div className="eyebrow">SUPPLIER PAYMENT</div><h2>Record Payment</h2><p>{detail.supplierName} · Remaining {peso(detail.balance)}</p></div><button type="button" className="icon-btn" onClick={onClose}>×</button></div><label><span className="label">Payment Date</span><input className="text-input" type="date" value={form.paymentDate} onChange={e=>setForm({...form,paymentDate:e.target.value})} required/></label><label><span className="label">Amount</span><input className="big-input" inputMode="decimal" autoFocus value={form.amount} onChange={e=>setForm({...form,amount:e.target.value})} placeholder="0.00" required/></label><div className="calculation"><div><span>Remaining before payment</span><strong>{peso(detail.balance)}</strong></div><div className="calc-total"><span>Remaining after payment</span><strong>{peso(Math.max(0,detail.balance-(Number(form.amount)||0)))}</strong></div></div><label><span className="label">Notes <small>(optional)</small></span><textarea className="text-input debt-notes" value={form.notes} onChange={e=>setForm({...form,notes:e.target.value})} placeholder="Optional payment note..."/></label>{error&&<div className="field-error">{error}</div>}<div className="form-actions"><button type="button" className="secondary" onClick={onClose} disabled={busy}>Cancel</button><button type="submit" className="primary" disabled={busy||!(Number(form.amount)>0)||Number(form.amount)>detail.balance+0.005}>{busy?"Saving...":"Save Payment"}</button></div></form></div>;
+}
+
+function OwnerMenu({ onProducts, onDashboard, onReports, onSettings, onStaff, onAudit, onDebt, onLock, onHome, storeInfo }) {
   return <main className="owner-menu-page">
     <div className="owner-menu-wrap">
       <button className="owner-back" onClick={onHome}><span className="back-arrow">←</span><span>Home</span></button>
@@ -641,7 +716,7 @@ function OwnerMenu({ onProducts, onDashboard, onReports, onSettings, onStaff, on
         <button className="owner-menu-card" onClick={onDashboard}><span className="owner-menu-card-icon">▥</span><div><b>Business Dashboard</b><small>Sales, profit and accounting</small></div><i>→</i></button>
         <button className="owner-menu-card" onClick={onReports}><span className="owner-menu-card-icon">▤</span><div><b>Sales Reports</b><small>Detailed sales records and summaries</small></div><i>→</i></button>
         <button className="owner-menu-card" onClick={onProducts}><span className="owner-menu-card-icon">▦</span><div><b>Manage Products</b><small>Products, prices and categories</small></div><i>→</i></button>
-        <button className="owner-menu-card" onClick={onStaff}><span className="owner-menu-card-icon">👥</span><div><b>Staff Management</b><small>Staff activity and transaction history</small></div><i>→</i></button><button className="owner-menu-card" onClick={onAudit}><span className="owner-menu-card-icon">◷</span><div><b>Activity &amp; Audit Log</b><small>Security and important staff actions</small></div><i>→</i></button>
+        <button className="owner-menu-card" onClick={onStaff}><span className="owner-menu-card-icon">👥</span><div><b>Staff Management</b><small>Staff activity and transaction history</small></div><i>→</i></button><button className="owner-menu-card" onClick={onDebt}><span className="owner-menu-card-icon">₱</span><div><b>Debt Tracker</b><small>Supplier deliveries and payments</small></div><i>→</i></button><button className="owner-menu-card" onClick={onAudit}><span className="owner-menu-card-icon">◷</span><div><b>Activity &amp; Audit Log</b><small>Security and important staff actions</small></div><i>→</i></button>
         <button className="owner-menu-card" onClick={onSettings}><span className="owner-menu-card-icon">⚙</span><div><b>Owner / Admin Settings</b><small>Passcode, recovery and session lock</small></div><i>→</i></button>
       </div>
       <button className="owner-lock" onClick={onLock}>🔒 Lock Admin Access</button>
@@ -651,34 +726,19 @@ function OwnerMenu({ onProducts, onDashboard, onReports, onSettings, onStaff, on
 }
 
 function BackupRestore({ onBackup, onRestore }) {
-  const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState("");
-  const [error, setLocalError] = useState("");
-  const fileRef = useRef(null);
-  const backup = async () => {
-    setBusy(true); setMessage(""); setLocalError("");
-    try { await onBackup(); setMessage("Backup downloaded successfully."); }
-    catch (e) { setLocalError(e.message || "Could not create the backup."); }
-    finally { setBusy(false); }
-  };
-  const restore = async e => {
-    const file = e.target.files?.[0];
-    e.target.value = "";
-    if (!file) return;
-    setMessage(""); setLocalError("");
-    if (!file.name.toLowerCase().endsWith(".zip") && !file.name.toLowerCase().endsWith(".sqlite")) { setLocalError("Please choose a .zip complete backup or a legacy .sqlite Grocery POS backup."); return; }
-    const confirmed = window.confirm("Restore this backup? This will replace the POS database and, for complete .zip backups, the product images currently stored in this POS. This cannot be undone.\n\nMake a fresh backup first if you want to keep the current data.");
-    if (!confirmed) return;
-    setBusy(true);
-    try { await onRestore(file); }
-    catch (err) { setLocalError(err.message || "Could not restore the backup."); setBusy(false); }
-  };
+  const [busy,setBusy]=useState(false), [message,setMessage]=useState(""), [error,setLocalError]=useState("");
+  const [pendingFile,setPendingFile]=useState(null), [schemaWarning,setSchemaWarning]=useState(null);
+  const fileRef=useRef(null);
+  const backup=async()=>{setBusy(true);setMessage("");setLocalError("");try{await onBackup();setMessage("Backup downloaded successfully.");}catch(e){setLocalError(e.message||"Could not create the backup.");}finally{setBusy(false);}};
+  const chooseRestore=e=>{const file=e.target.files?.[0];e.target.value="";if(!file)return;setMessage("");setLocalError("");if(!file.name.toLowerCase().endsWith(".zip")&&!file.name.toLowerCase().endsWith(".sqlite")){setLocalError("Please choose a .zip complete backup or a legacy .sqlite Grocery POS backup.");return;}setPendingFile(file);};
+  const performRestore=async(allowSchemaMismatch=false)=>{if(!pendingFile)return;setBusy(true);setLocalError("");try{const result=await onRestore(pendingFile,allowSchemaMismatch);if(result?.needsSchemaConfirmation){setSchemaWarning(result);setBusy(false);return;}setPendingFile(null);setSchemaWarning(null);}catch(err){setLocalError(err.message||"Could not restore the backup.");setBusy(false);}};
   return <section className="settings-card backup-card">
     <div className="settings-card-head"><div><div className="eyebrow">DATA SAFETY</div><h3>Backup & Restore</h3><p>Download a complete POS backup containing your database and uploaded product images, or restore a previous backup.</p></div><span className="settings-badge good">Complete</span></div>
-    <div className="backup-actions"><button className="secondary" onClick={backup} disabled={busy}>{busy ? "Working..." : "⇩ Download Backup"}</button><button className="secondary" onClick={() => fileRef.current?.click()} disabled={busy}>⇧ Restore Backup</button><input ref={fileRef} type="file" accept=".zip,.sqlite,application/zip,application/x-sqlite3" onChange={restore} hidden /></div>
+    <div className="backup-actions"><button className="secondary" onClick={backup} disabled={busy}>{busy?"Working...":"⇩ Download Backup"}</button><button className="secondary" onClick={()=>fileRef.current?.click()} disabled={busy}>⇧ Restore Backup</button><input ref={fileRef} type="file" accept=".zip,.sqlite,application/zip,application/x-sqlite3" onChange={chooseRestore} hidden /></div>
     <div className="backup-note"><strong>Complete backup:</strong> The downloaded <code>.zip</code> contains <code>pos.sqlite</code> plus the <code>product-images/</code> folder. Store logo/receipt settings are already inside the database. Older <code>.sqlite</code> backups remain supported, but they cannot contain uploaded product images.</div>
-    {message && <div className="backup-success">{message}</div>}
-    {error && <div className="field-error">{error}</div>}
+    {message&&<div className="backup-success">{message}</div>}{error&&<div className="field-error">{error}</div>}
+    {pendingFile&&!schemaWarning&&<ConfirmModal title="Restore Backup?" message={<><strong>{pendingFile.name}</strong><br/><br/>This will replace the POS business data and, for complete ZIP backups, the product images currently stored in this POS. Your current machine's admin passcode and security credentials will be kept. A fresh backup should be made first if you want to keep the current data.</>} confirmLabel="Restore Backup" danger busy={busy} onConfirm={()=>performRestore(false)} onCancel={()=>{if(!busy)setPendingFile(null)}} />}
+    {schemaWarning&&<ConfirmModal title="Backup Version Difference" message={<>{schemaWarning.warning||"This backup was created with a different database schema. Compatible fields will be restored and newer fields will keep their current defaults."}{schemaWarning.mismatches?.length>0&&<div className="confirm-schema-list">{schemaWarning.mismatches.map((m,i)=><div key={i}><strong>{m.table}</strong>{m.missingInBackup?.length?<> · Missing: {m.missingInBackup.join(", ")}</>:null}{m.extraInBackup?.length?<> · Extra: {m.extraInBackup.join(", ")}</>:null}</div>)}</div>}<br/><strong>Your current admin/security credentials will not be replaced.</strong></>} confirmLabel="Restore Anyway" danger busy={busy} onConfirm={()=>performRestore(true)} onCancel={()=>{if(!busy){setSchemaWarning(null);setPendingFile(null)}}} />}
   </section>;
 }
 
@@ -739,7 +799,7 @@ function OwnerSettings({ settings, loading, onLoad, onChangePasscode, onGenerate
       {loading && !settings ? <div className="loading">Loading security settings...</div> : <div className="settings-grid">
         <section className="settings-card"><div className="settings-card-head"><div><div className="eyebrow">PASSCODE</div><h3>Admin Passcode</h3><p>Used for refunds, products, dashboard and these settings.</p></div><span className="settings-badge">Protected</span></div><button className="secondary wide" onClick={() => setChangeOpen(true)}>Change Admin Passcode</button></section>
         <section className="settings-card"><div className="settings-card-head"><div><div className="eyebrow">RECOVERY</div><h3>Recovery Code</h3><p>{settings?.hasRecoveryCode ? "A recovery code is configured." : "No recovery code is configured yet."}</p></div><span className={`settings-badge ${settings?.hasRecoveryCode ? "good" : "warn"}`}>{settings?.hasRecoveryCode ? "Ready" : "Not set"}</span></div><button className="secondary wide" onClick={generate} disabled={busy}>{busy ? "Generating..." : settings?.hasRecoveryCode ? "Generate New Recovery Code" : "Generate Recovery Code"}</button>{recoveryVisible && <div className="recovery-created-inline"><strong>{recoveryCode}</strong><button className="secondary small-btn" onClick={() => navigator.clipboard?.writeText(recoveryCode)}>Copy</button><small>Save this code. The previous recovery code is no longer valid.</small></div>}</section>
-        <section className="settings-card"><div className="settings-card-head"><div><div className="eyebrow">AUTO LOCK</div><h3>Admin Session Timeout</h3><p>Lock owner features after inactivity.</p></div></div><div className="timeout-options">{[5,10,15,30].map(v => <button key={v} className={settings?.sessionTimeoutMinutes === v ? "active" : ""} onClick={async () => { await onChangeTimeout(v); }}>{v} min</button>)}</div><small className="form-hint">The server also expires the admin session after the selected timeout.</small></section>
+        <section className="settings-card"><div className="settings-card-head"><div><div className="eyebrow">AUTO LOCK</div><h3>Admin Session Timeout</h3><p>Lock owner features after inactivity.</p></div></div><div className="timeout-options">{[[5,"5 min"],[10,"10 min"],[15,"15 min"],[30,"30 min"],[0,"Never"]].map(([v,label]) => <button type="button" key={v} className={settings?.sessionTimeoutMinutes === v ? "active" : ""} onClick={async () => { await onChangeTimeout(v); }}>{label}</button>)}</div><small className="form-hint">{settings?.sessionTimeoutMinutes === 0 ? "The Owner/Admin session will remain active until you lock it manually." : "The server also expires the admin session after the selected timeout."}</small></section>
         <section className="settings-card danger-card"><div className="settings-card-head"><div><div className="eyebrow">SESSION</div><h3>Lock Admin Access</h3><p>Immediately end the current owner session.</p></div></div><button className="danger wide" onClick={onLock}>🔒 Lock Now</button></section>
         <StoreInfoSettings storeInfo={storeInfo} loading={storeInfoLoading} onLoad={onLoadStoreInfo} onSave={onSaveStoreInfo} />
         <ReceiptSettings settings={receiptSettings} loading={receiptSettingsLoading} onLoad={onLoadReceiptSettings} onSave={onSaveReceiptSettings} storeInfo={storeInfo} />
@@ -1270,6 +1330,9 @@ function App() {
   const [loadingStaff, setLoadingStaff] = useState(false);
   const [auditFilters, setAuditFilters] = useState({ start: todayISO, end: todayISO, staff: "all", action: "all", q: "", page: 1, limit: 50 });
   const [auditData, setAuditData] = useState(null);
+  const [debtFilters, setDebtFilters] = useState({ status:"all", supplier:"", q:"", page:1, limit:25 });
+  const [debtData, setDebtData] = useState(null);
+  const [loadingDebt, setLoadingDebt] = useState(false);
   const [loadingAudit, setLoadingAudit] = useState(false);
   const [salesSeries, setSalesSeries] = useState([]);
   const [salesGranularity, setSalesGranularity] = useState("daily");
@@ -1362,6 +1425,12 @@ function App() {
   };
   const updateAuditFilters = updater => { setAuditFilters(prev=>{const next=typeof updater==="function"?updater(prev):{...prev,...updater}; setTimeout(()=>loadAudit(next).catch(()=>{}),0); return next;}); };
 
+  const loadDebts = async (override = {}) => { const f={...debtFilters,...override}; setLoadingDebt(true); try { const qs=new URLSearchParams({status:f.status||"all",supplier:f.supplier||"",q:f.q||"",page:String(f.page||1),limit:String(f.limit||25)}); const d=await api(`/api/debts?${qs.toString()}`,{},adminToken); setDebtData(d); return d; } finally { setLoadingDebt(false); } };
+  const updateDebtFilters = next => { setDebtFilters(next); loadDebts(next); };
+  const saveDebt = async form => { const body={supplierName:form.supplierName,debtDate:form.debtDate,notes:form.notes,items:form.items.map(x=>({quantity:String(x.quantity??"").trim(),description:x.description,cost:Number(x.cost)}))}; const result=await api(form.id?`/api/debts/${form.id}`:"/api/debts",{method:form.id?"PUT":"POST",body:JSON.stringify(body)},adminToken); await loadDebts(debtFilters); return result; };
+  const deleteDebt = async id => { await api(`/api/debts/${id}`,{method:"DELETE"},adminToken); };
+  const saveDebtPayment = async (id,form) => api(`/api/debts/${id}/payments`,{method:"POST",body:JSON.stringify({paymentDate:form.paymentDate,amount:Number(form.amount),notes:form.notes})},adminToken);
+  const deleteDebtPayment = async (debtId,paymentId) => api(`/api/debts/${debtId}/payments/${paymentId}`,{method:"DELETE"},adminToken);
   const loadCashiers = async () => api("/api/cashiers", {}, adminToken);
   const saveCashier = async data => {
     const url = data.id ? `/api/cashiers/${data.id}` : "/api/cashiers";
@@ -1376,7 +1445,7 @@ function App() {
     try {
       const result = await api("/api/auth/settings", {}, adminToken);
       setAdminSettings(result);
-      setAdminTimeoutMinutes(Number(result.sessionTimeoutMinutes) || 15);
+      setAdminTimeoutMinutes(Number.isFinite(Number(result.sessionTimeoutMinutes)) ? Number(result.sessionTimeoutMinutes) : 15);
       return result;
     } catch (e) {
       setError(e.message);
@@ -1405,7 +1474,7 @@ function App() {
   const changeAdminTimeout = async minutes => {
     const result = await api("/api/auth/settings", { method:"PUT", body:JSON.stringify({ sessionTimeoutMinutes: minutes }) }, adminToken);
     setAdminSettings(result);
-    setAdminTimeoutMinutes(Number(result.sessionTimeoutMinutes) || minutes);
+    setAdminTimeoutMinutes(Number.isFinite(Number(result.sessionTimeoutMinutes)) ? Number(result.sessionTimeoutMinutes) : minutes);
   };
 
   const lockAdmin = async () => {
@@ -1432,13 +1501,16 @@ function App() {
     const a = document.createElement("a"); a.href = url; a.download = filename; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
   };
 
-  const restoreDatabaseBackup = async file => {
-    const res = await fetch("/api/backup/restore", { method: "POST", headers: { "x-admin-token": adminToken, "Content-Type": "application/octet-stream" }, body: file });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.error || "Could not restore the database backup.");
-    alert(data.message || "Database restored successfully.");
-    setAdminToken(""); setAdminPending(null); setAdminModalOpen(false); setScreen("home");
+  const restoreDatabaseBackup = async (file, allowSchemaMismatch=false) => {
+    const headers={"x-admin-token":adminToken,"Content-Type":"application/octet-stream"};
+    if(allowSchemaMismatch) headers["x-allow-schema-mismatch"]="true";
+    const res=await fetch("/api/backup/restore",{method:"POST",headers,body:file});
+    const data=await res.json().catch(()=>({}));
+    if(res.status===409&&data.code==="SCHEMA_MISMATCH") return {needsSchemaConfirmation:true,warning:data.warning,mismatches:data.mismatches||[]};
+    if(!res.ok) throw new Error(data.error||"Could not restore the database backup.");
+    setAdminToken("");setAdminPending(null);setAdminModalOpen(false);setScreen("home");
     window.location.reload();
+    return {ok:true};
   };
 
   const touchAdminActivity = () => {
@@ -1538,14 +1610,14 @@ function App() {
     const events = ["mousedown", "keydown", "touchstart", "click"];
     const mark = () => { adminLastActivityRef.current = Date.now(); };
     events.forEach(event => window.addEventListener(event, mark, { passive: true }));
-    const timer = window.setInterval(() => {
+    const timer = adminTimeoutMinutes === 0 ? null : window.setInterval(() => {
       const timeoutMs = adminTimeoutMinutes * 60 * 1000;
       const lastActivity = adminLastActivityRef.current;
       if (lastActivity && Date.now() - lastActivity >= timeoutMs) lockAdmin();
     }, 15000);
     return () => {
       events.forEach(event => window.removeEventListener(event, mark));
-      window.clearInterval(timer);
+      if (timer) window.clearInterval(timer);
     };
   }, [adminToken, adminTimeoutMinutes]);
 
@@ -1725,12 +1797,15 @@ function App() {
     onDashboard={() => { setScreen("dashboard"); loadDashboard(dashboardData?.days || 30); loadSalesSeries(salesGranularity); loadTopProducts(topProductsPeriod); loadPerformanceProducts(topProductsPeriod, performanceSearch); }}
     onReports={() => { setScreen("reports"); loadReports(); }}
     onStaff={() => { setScreen("staff"); loadStaff(); }}
+    onDebt={() => { setScreen("debt"); loadDebts(); }}
     onAudit={() => { setScreen("audit"); loadAudit(); }}
     onSettings={() => { setScreen("settings"); loadAdminSettings(); }}
     onLock={lockAdmin}
     onHome={goHome}
     storeInfo={storeInfo}
   />;
+
+  if (screen === "debt") return <DebtTracker data={debtData} loading={loadingDebt} filters={debtFilters} onFiltersChange={updateDebtFilters} onRefresh={() => loadDebts(debtFilters)} onHome={goOwner} onSaveDebt={saveDebt} onDeleteDebt={deleteDebt} onSavePayment={saveDebtPayment} onDeletePayment={deleteDebtPayment} storeInfo={storeInfo} adminToken={adminToken} />;
 
   if (screen === "staff") return <StaffManagement data={staffData} loading={loadingStaff} filters={staffFilters} onFiltersChange={updateStaffFilters} onRefresh={() => loadStaff(staffFilters)} onHome={goOwner} onSelectStaff={id => updateStaffFilters(f => ({...f, staff:id, page:1}))} />;
 

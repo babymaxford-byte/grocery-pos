@@ -2,7 +2,7 @@
 "use strict";
 
 /*
- * EverJoy POS Manager 4.8.20
+ * EverJoy POS Manager 4.9.7
  * Local process supervisor + safe application updater.
  *
  * The manager API is intentionally bound to 127.0.0.1 only.
@@ -29,6 +29,7 @@ const UPDATE_ZIP = path.join(UPDATE_DIR, "incoming.zip");
 const UPDATE_STATUS = path.join(UPDATE_DIR, "status.json");
 const BACKUP_DIR = path.join(MANAGER_DIR, "backups");
 const ROLLBACK_DIR = path.join(MANAGER_DIR, "rollbacks");
+const MANAGER_TOKEN_FILE = path.join(MANAGER_DIR, "manager-access.token");
 const API_PORT = Number(process.env.POS_MANAGER_PORT || 3010);
 const POS_URL = process.env.POS_URL || "http://127.0.0.1:5173";
 const API_URL = process.env.POS_API_URL || "http://127.0.0.1:3001";
@@ -36,8 +37,19 @@ const MANAGER_UI = path.join(ROOT, "manager-ui", "index.html");
 const MAX_UPDATE_BYTES = 300 * 1024 * 1024;
 const MAX_ZIP_ENTRIES = 5000;
 const MAX_UNCOMPRESSED_UPDATE_BYTES = 700 * 1024 * 1024;
+const DEFAULT_GITHUB_REPO = "babymaxford-byte/grocery-pos";
+const GITHUB_API = "https://api.github.com";
+let githubDownloadInProgress = false;
 
 for (const dir of [MANAGER_DIR, LOG_DIR, UPDATE_DIR, BACKUP_DIR, ROLLBACK_DIR]) fs.mkdirSync(dir, { recursive: true });
+
+function getManagerAccessToken() {
+  try { const existing = fs.readFileSync(MANAGER_TOKEN_FILE, "utf8").trim(); if (/^[a-f0-9]{64}$/i.test(existing)) return existing; } catch {}
+  const token = crypto.randomBytes(32).toString("hex");
+  try { fs.writeFileSync(MANAGER_TOKEN_FILE, token + "\n", { mode: 0o600 }); fs.chmodSync(MANAGER_TOKEN_FILE, 0o600); } catch {}
+  return token;
+}
+const MANAGER_ACCESS_TOKEN = getManagerAccessToken();
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 function readPid() { try { return Number(fs.readFileSync(PID_FILE, "utf8").trim()) || 0; } catch { return 0; } }
@@ -67,7 +79,7 @@ function spawnPos(command, args, logName) {
   const logPath = path.join(LOG_DIR, logName);
   const child = spawn(command, args, {
     cwd: ROOT,
-    env: { ...process.env, FORCE_COLOR: "0" },
+    env: { ...process.env, FORCE_COLOR: "0", POS_MANAGER_TOKEN: MANAGER_ACCESS_TOKEN },
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: process.platform === "win32"
   });
@@ -148,19 +160,50 @@ async function status() {
   };
 }
 
-function killTree(child) {
+function descendantPids(rootPid) {
+  const result = [];
+  if (!rootPid) return result;
+  try {
+    if (process.platform === "win32") return result;
+    const out = execFileSync("ps", ["-eo", "pid=,ppid="], { encoding: "utf8" });
+    const children = new Map();
+    for (const line of out.split(/\r?\n/)) {
+      const m = line.trim().match(/^(\d+)\s+(\d+)$/);
+      if (!m) continue;
+      const pid = Number(m[1]), ppid = Number(m[2]);
+      if (!children.has(ppid)) children.set(ppid, []);
+      children.get(ppid).push(pid);
+    }
+    const queue = [Number(rootPid)], seen = new Set();
+    while (queue.length) {
+      const parent = queue.shift();
+      for (const pid of (children.get(parent) || [])) {
+        if (seen.has(pid)) continue;
+        seen.add(pid); result.push(pid); queue.push(pid);
+      }
+    }
+  } catch {}
+  return result;
+}
+
+function killPidTree(pid, { force = false } = {}) {
   return new Promise(resolve => {
-    if (!child || !child.pid) return resolve();
-    const pid = child.pid;
+    if (!pid || pid === process.pid) return resolve();
     if (process.platform === "win32") {
       try { execFileSync("taskkill", ["/PID", String(pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" }); } catch {}
       return resolve();
     }
-    try { process.kill(pid, "SIGTERM"); } catch {}
-    const deadline = Date.now() + 3000;
+    const descendants = descendantPids(pid);
+    const signal = force ? "SIGKILL" : "SIGTERM";
+    for (const childPid of descendants.reverse()) { try { process.kill(childPid, signal); } catch {} }
+    try { process.kill(pid, signal); } catch {}
+    const deadline = Date.now() + (force ? 1000 : 3500);
     const wait = () => {
       if (!processExists(pid) || Date.now() >= deadline) {
-        if (processExists(pid)) { try { process.kill(pid, "SIGKILL"); } catch {} }
+        if (!force && processExists(pid)) {
+          for (const childPid of descendantPids(pid).reverse()) { try { process.kill(childPid, "SIGKILL"); } catch {} }
+          try { process.kill(pid, "SIGKILL"); } catch {}
+        }
         return resolve();
       }
       setTimeout(wait, 100);
@@ -169,12 +212,31 @@ function killTree(child) {
   });
 }
 
-async function stopPos() {
-  log("Stopping POS processes...");
-  const a = serverChild, b = clientChild;
+function killTree(child, options = {}) { return killPidTree(child && child.pid, options); }
+
+async function stopPos({ force = false } = {}) {
+  log(`${force ? "Force stopping" : "Stopping"} POS processes...`);
+
+  // Do not rely only on child-process references. A POS may have been
+  // started outside this Manager, or its original npm process may have
+  // exited while the actual Node service kept listening on its port.
+  const apiPort = Number(new URL(API_URL).port || 3001);
+  const frontendPort = Number(new URL(POS_URL).port || 5173);
+  const tracked = [childPid(serverChild), childPid(clientChild)];
+  const listening = [portListeningPid(apiPort), portListeningPid(frontendPort)];
+  const pids = [...new Set([...tracked, ...listening].filter(pid => pid && pid !== process.pid))];
+
   serverChild = null; clientChild = null;
-  await Promise.all([killTree(a), killTree(b)]);
-  log("POS processes stopped.");
+  if (!pids.length) {
+    log("No POS processes found to stop.");
+    return;
+  }
+
+  await Promise.all(pids.map(pid => killPidTree(pid, { force })));
+
+  // Give the OS a moment to release the listening sockets.
+  await sleep(150);
+  log(`POS processes stopped. Target PIDs: ${pids.join(", ")}`);
 }
 
 async function startPos({ openBrowser = true } = {}) {
@@ -351,6 +413,104 @@ async function requestBody(req, limit=MAX_UPDATE_BYTES) {
 async function validateIncomingUpdate() { const buffer=await fsp.readFile(UPDATE_ZIP); const info=readUpdatePackage(buffer); const cur=currentVersion(); if(cur!=="unknown" && compareVersions(info.package.version,cur)<=0) throw new Error(`Update version ${info.package.version} is not newer than the installed version ${cur}.`); return info; }
 function compareVersions(a,b){const parse=v=>String(v).trim().split(/[+-]/,1)[0].split(".").map(Number);const pa=parse(a),pb=parse(b);for(let i=0;i<3;i++){const av=Number.isFinite(pa[i])?pa[i]:0;const bv=Number.isFinite(pb[i])?pb[i]:0;if(av!==bv)return av-bv;}return 0;}
 
+function readManagerConfig() {
+  try { return JSON.parse(fs.readFileSync(CONFIG_FILE, "utf8")); } catch { return {}; }
+}
+function writeManagerConfig(patch) {
+  const next = { ...readManagerConfig(), ...patch, updatedAt: new Date().toISOString() };
+  fs.writeFileSync(CONFIG_FILE, JSON.stringify(next, null, 2), "utf8");
+  return next;
+}
+function githubRepo() { return readManagerConfig().githubRepo || DEFAULT_GITHUB_REPO; }
+function normalizeGithubRepo(value) {
+  let v = String(value || "").trim();
+  v = v.replace(/^https?:\/\/(www\.)?github\.com\//i, "").replace(/\.git$/i, "").replace(/^\/+|\/+$/g, "");
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(v)) throw new Error("GitHub repository must look like owner/repository.");
+  return v;
+}
+function githubHeaders() {
+  return {
+    "Accept": "application/vnd.github+json",
+    "User-Agent": "EverJoy-POS-Manager",
+    "X-GitHub-Api-Version": "2022-11-28"
+  };
+}
+async function githubFetchJson(url) {
+  const res = await fetch(url, { headers: githubHeaders(), redirect: "follow" });
+  const text = await res.text();
+  let data = {};
+  try { data = JSON.parse(text); } catch {}
+  if (!res.ok) {
+    const msg = data.message || `GitHub request failed with HTTP ${res.status}.`;
+    if (res.status === 404) throw new Error("GitHub repository or latest release was not found. Make sure the repository is public and has a published release.");
+    if (res.status === 403) throw new Error("GitHub rate limit or access restriction was encountered. Try again later.");
+    throw new Error(msg);
+  }
+  return data;
+}
+async function getGithubLatestRelease() {
+  const repo = githubRepo();
+  const data = await githubFetchJson(`${GITHUB_API}/repos/${repo}/releases/latest`);
+  const tag = String(data.tag_name || "").trim().replace(/^v/i, "");
+  if (!/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(tag)) throw new Error(`GitHub release tag "${data.tag_name || ""}" does not contain a supported POS version.`);
+  const zipAssets = Array.isArray(data.assets) ? data.assets.filter(a => String(a.name || "").toLowerCase().endsWith(".zip")) : [];
+  if (!zipAssets.length) throw new Error("The latest GitHub release does not contain a .zip POS update asset.");
+  const preferred = zipAssets.find(a => String(a.name).toLowerCase().includes("grocery-pos")) || zipAssets[0];
+  return {
+    repo,
+    id: data.id,
+    tag: data.tag_name,
+    version: tag,
+    name: data.name || data.tag_name,
+    body: data.body || "",
+    publishedAt: data.published_at || data.created_at || null,
+    htmlUrl: data.html_url || `https://github.com/${repo}/releases/tag/${data.tag_name}`,
+    asset: {
+      id: preferred.id,
+      name: preferred.name,
+      size: Number(preferred.size || 0),
+      url: preferred.url,
+      browserDownloadUrl: preferred.browser_download_url,
+      digest: preferred.digest || null
+    }
+  };
+}
+async function downloadGithubRelease(release) {
+  if (githubDownloadInProgress) throw new Error("A GitHub update download is already in progress.");
+  githubDownloadInProgress = true;
+  const temp = path.join(UPDATE_DIR, `github-${Date.now()}.part`);
+  try {
+    writeUpdateStatus({ state: "github-downloading", source: "github", repo: release.repo, releaseUrl: release.htmlUrl, newVersion: release.version, assetName: release.asset.name, releaseName: release.name, releaseNotes: release.body, digest: release.asset.digest, downloadedBytes: 0, totalBytes: release.asset.size, message: `Downloading ${release.asset.name} from GitHub…` });
+    const res = await fetch(release.asset.url, { headers: { ...githubHeaders(), "Accept": "application/octet-stream" }, redirect: "follow" });
+    if (!res.ok || !res.body) throw new Error(`GitHub asset download failed with HTTP ${res.status}.`);
+    const total = Number(res.headers.get("content-length") || release.asset.size || 0);
+    if (total > MAX_UPDATE_BYTES) throw new Error("The GitHub update package is larger than the 300 MB limit.");
+    const out = fs.createWriteStream(temp);
+    const hash = crypto.createHash("sha256");
+    let downloaded = 0;
+    try {
+      for await (const chunk of res.body) {
+        downloaded += chunk.length;
+        if (downloaded > MAX_UPDATE_BYTES) throw new Error("The GitHub update package exceeded the 300 MB limit.");
+        hash.update(chunk); out.write(chunk);
+        if (downloaded === chunk.length || downloaded - (githubDownloadProgressLast || 0) >= 256 * 1024) { githubDownloadProgressLast = downloaded; writeUpdateStatus({ downloadedBytes: downloaded, totalBytes: total }); }
+      }
+    } finally { out.end(); await new Promise(resolve => out.once("close", resolve)); }
+    const actual = hash.digest("hex");
+    const expected = release.asset.digest && /^sha256:/i.test(release.asset.digest) ? release.asset.digest.slice(7).toLowerCase() : null;
+    if (expected && actual !== expected) throw new Error("GitHub update checksum verification failed. The downloaded file does not match GitHub's SHA-256 digest.");
+    await fsp.rename(temp, UPDATE_ZIP);
+    const info = await validateIncomingUpdate();
+    writeUpdateStatus({ state: "github-ready", source: "github", repo: release.repo, releaseUrl: release.htmlUrl, releaseName: release.name, releaseNotes: release.body, assetName: release.asset.name, digest: release.asset.digest || `sha256:${actual}`, downloadedBytes: downloaded, totalBytes: total, filename: release.asset.name, newVersion: info.package.version, size: info.size, uncompressedSize: info.uncompressedSize, message: `✓ GitHub update ${info.package.version} downloaded, verified, and validated.` });
+    return info;
+  } catch (error) {
+    try { await fsp.unlink(temp); } catch {}
+    writeUpdateStatus({ state: "github-failed", source: "github", message: error.message, error: error.message });
+    throw error;
+  } finally { githubDownloadInProgress = false; githubDownloadProgressLast = 0; }
+}
+let githubDownloadProgressLast = 0;
+
 function diskInfo() {
   try { const s=fs.statfsSync(DATA_DIR); return {freeBytes:Number(s.bavail)*Number(s.bsize), totalBytes:Number(s.blocks)*Number(s.bsize)}; } catch { return null; }
 }
@@ -364,7 +524,7 @@ const sleep=ms=>new Promise(r=>setTimeout(r,ms)); const exists=p=>{try{fs.access
 const writeStatus=o=>{let x={};try{x=JSON.parse(fs.readFileSync(STATUS,'utf8'))}catch{};fs.writeFileSync(STATUS,JSON.stringify({...x,...o,updatedAt:new Date().toISOString()},null,2))};
 function waitPid(pid,timeout){return new Promise(resolve=>{const st=Date.now();const c=()=>{if(!pid||!existsPid(pid)||Date.now()-st>timeout)return resolve(true);setTimeout(c,250)};c()})}; function existsPid(pid){try{process.kill(Number(pid),0);return true}catch{return false}};
 function copyDir(src,dst,exclude){for(const ent of fs.readdirSync(src,{withFileTypes:true})){if(exclude.has(ent.name))continue;const a=path.join(src,ent.name),b=path.join(dst,ent.name);if(ent.isDirectory()){fs.mkdirSync(b,{recursive:true});copyDir(a,b,exclude)}else fs.copyFileSync(a,b)}}
-function removeAppFiles(root){for(const ent of fs.readdirSync(root,{withFileTypes:true})){if(['data','node_modules','.git'].includes(ent.name))continue;const p=path.join(root,ent.name);if(ent.isDirectory())fs.rmSync(p,{recursive:true,force:true});else fs.rmSync(p,{force:true})}}
+function removeAppFiles(root){const preserved=new Set(['data','node_modules','.git','start-manager-linux.sh','start-manager-windows.bat','start-pos-linux.sh','start-pos-windows.bat']);for(const ent of fs.readdirSync(root,{withFileTypes:true})){if(preserved.has(ent.name))continue;const p=path.join(root,ent.name);if(ent.isDirectory())fs.rmSync(p,{recursive:true,force:true});else fs.rmSync(p,{force:true})}}
 function copyAll(src,dst){for(const ent of fs.readdirSync(src,{withFileTypes:true})){const a=path.join(src,ent.name),b=path.join(dst,ent.name);if(ent.isDirectory()){fs.mkdirSync(b,{recursive:true});copyAll(a,b)}else{fs.mkdirSync(path.dirname(b),{recursive:true});fs.copyFileSync(a,b)}}}
 function run(cmd,args,cwd){return new Promise((resolve,reject)=>{const p=spawn(cmd,args,{cwd,stdio:'pipe',windowsHide:process.platform==='win32'});let out='';p.stdout.on('data',d=>{out+=d.toString();log(d.toString().trim())});p.stderr.on('data',d=>{out+=d.toString();log(d.toString().trim())});p.on('error',reject);p.on('close',c=>c===0?resolve(out):reject(new Error(cmd+' exited with code '+c)))})}
 async function stopManagerByApi(){try{await new Promise((resolve,reject)=>{const r=http.get('http://127.0.0.1:3010/status',x=>{let b='';x.on('data',d=>b+=d);x.on('end',()=>{try{const s=JSON.parse(b);const pid=Number(s.managerPid);if(pid&&process.platform==='win32'){try{execFileSync('taskkill',['/PID',String(pid),'/T','/F'],{stdio:'ignore',windowsHide:true})}catch{}}else if(pid){try{process.kill(pid,'SIGTERM')}catch{}}resolve()}catch{resolve()}})});r.on('error',()=>resolve());r.setTimeout(1000,()=>{r.destroy();resolve()})})}catch{}}
@@ -411,6 +571,32 @@ async function shutdownForUpdate(){ if(shuttingDown)return; shuttingDown=true; l
 
 function serveManagerUi(req,res){ if(req.method!=="GET")return false; const pathname=new URL(req.url,`http://127.0.0.1:${API_PORT}`).pathname; if(pathname!=="/"&&pathname!=="/index.html")return false; if(!fs.existsSync(MANAGER_UI)){res.statusCode=500;res.end("Manager UI is missing.");return true;}res.statusCode=200;res.setHeader("Content-Type","text/html; charset=utf-8");fs.createReadStream(MANAGER_UI).pipe(res);return true; }
 
+function postBackupToPos(buffer) {
+  return new Promise((resolve, reject) => {
+    const target = new URL("/api/backup/restore", API_URL);
+    const req = http.request(target, { method: "POST", headers: { "Content-Type": "application/octet-stream", "Content-Length": buffer.length, "X-Manager-Token": MANAGER_ACCESS_TOKEN, "X-Allow-Schema-Mismatch": "true" }, timeout: 120000 }, res => {
+      const chunks = []; res.on("data", chunk => chunks.push(chunk)); res.on("end", () => {
+        const text = Buffer.concat(chunks).toString("utf8"); let data = {}; try { data = JSON.parse(text); } catch { data = { error: text || `HTTP ${res.statusCode}` }; }
+        if (res.statusCode >= 200 && res.statusCode < 300) return resolve(data); const error = new Error(data.error || `POS restore failed with HTTP ${res.statusCode}.`); error.statusCode = res.statusCode; reject(error);
+      });
+    });
+    req.on("timeout", () => { try { req.destroy(new Error("POS restore request timed out.")); } catch {} }); req.on("error", reject); req.end(buffer);
+  });
+}
+
+async function restoreManagerBackup(name) {
+  if (!/^[A-Za-z0-9._-]+\.zip$/.test(name)) throw new Error("Invalid backup filename.");
+  const target = path.join(BACKUP_DIR, name); if (!fs.existsSync(target)) throw new Error("Backup not found.");
+  const stat = fs.statSync(target); if (stat.size > 300 * 1024 * 1024) throw new Error("Backup file is larger than the 300 MB restore limit.");
+  if (!(await probeUrl(API_URL))) { await startPos({ openBrowser: false }); if (!(await probeUrl(API_URL))) throw new Error("The POS server could not be started for restore."); }
+  const safetyPath = path.join(BACKUP_DIR, `pre-restore-${nowStamp()}.zip`); await createCompleteBackup(safetyPath);
+  const buffer = await fsp.readFile(target); let result;
+  try { result = await postBackupToPos(buffer); } catch (error) {
+    if (error.statusCode === 401) { log("POS restore endpoint rejected the Manager token; restarting POS under Manager control and retrying."); await stopPos(); await startPos({ openBrowser: false }); result = await postBackupToPos(buffer); } else throw error;
+  }
+  return { ...result, filename: name, safetyBackup: path.basename(safetyPath) };
+}
+
 function createManagerServer(){
  const server=http.createServer(async(req,res)=>{
   const url=new URL(req.url,`http://127.0.0.1:${API_PORT}`); if(serveManagerUi(req,res))return;
@@ -421,6 +607,10 @@ function createManagerServer(){
    if(req.method==="GET"&&url.pathname==="/status")return json(200,await status());
    if(req.method==="GET"&&url.pathname==="/logs")return json(200,{text:readManagerLog()});
    if(req.method==="GET"&&url.pathname==="/storage")return json(200,{dataDir:DATA_DIR,backupCount:fs.existsSync(BACKUP_DIR)?fs.readdirSync(BACKUP_DIR).filter(x=>x.endsWith('.zip')).length:0,storage:diskInfo(),dbSize:fs.existsSync(path.join(DATA_DIR,'pos.sqlite'))?fs.statSync(path.join(DATA_DIR,'pos.sqlite')).size:0});
+   if(req.method==="GET"&&url.pathname==="/github/config")return json(200,{repo:githubRepo()});
+   if(req.method==="POST"&&url.pathname==="/github/config"){const body=await requestBody(req,64*1024);let data={};try{data=JSON.parse(body.toString("utf8"))}catch{throw new Error("Invalid GitHub configuration JSON.");}const repo=normalizeGithubRepo(data.repo);writeManagerConfig({githubRepo:repo});return json(200,{ok:true,repo});}
+   if(req.method==="GET"&&url.pathname==="/github/check"){const release=await getGithubLatestRelease();const comparison=compareVersions(release.version,currentVersion());return json(200,{ok:true,release,installedVersion:currentVersion(),updateAvailable:comparison>0,comparison});}
+   if(req.method==="POST"&&url.pathname==="/github/download"){if(githubDownloadInProgress)return json(409,{error:"A GitHub update download is already in progress."});const release=await getGithubLatestRelease();if(compareVersions(release.version,currentVersion())<=0)throw new Error(`GitHub version ${release.version} is not newer than the installed version ${currentVersion()}.`);downloadGithubRelease(release).catch(error=>log(`GitHub download error: ${error.stack||error}`));return json(202,{ok:true,version:release.version,asset:release.asset.name});}
    if(req.method==="GET"&&url.pathname==="/update/status")return json(200,readUpdateStatus());
    if(req.method==="POST"&&url.pathname==="/update/clear"){try{fs.unlinkSync(UPDATE_STATUS)}catch{};return json(200,{ok:true,state:"idle"});}
    if(req.method==="GET"&&url.pathname==="/backups"){const items=fs.existsSync(BACKUP_DIR)?fs.readdirSync(BACKUP_DIR).filter(x=>x.endsWith(".zip")).map(name=>{const st=fs.statSync(path.join(BACKUP_DIR,name));return {name,size:st.size,createdAt:st.mtime.toISOString()}}).sort((a,b)=>b.createdAt.localeCompare(a.createdAt)):[];return json(200,{items});}
@@ -428,8 +618,10 @@ function createManagerServer(){
    if(req.method==="POST"&&url.pathname==="/start"){await startPos({openBrowser:false});return json(200,{ok:true,...await status()});}
    if(req.method==="POST"&&url.pathname==="/restart"){await stopPos();await startPos({openBrowser:false});return json(200,{ok:true,...await status()});}
    if(req.method==="POST"&&url.pathname==="/stop"){await stopPos();return json(200,{ok:true,...await status()});}
+   if(req.method==="POST"&&url.pathname==="/force-stop"){await stopPos({force:true});return json(200,{ok:true,...await status()});}
    if(req.method==="POST"&&url.pathname==="/open"){openBrowserUrl(POS_URL);return json(200,{ok:true});}
    if(req.method==="POST"&&url.pathname==="/backup/create"){const target=path.join(BACKUP_DIR,`manual-${nowStamp()}.zip`);const result=await createCompleteBackup(target);return json(200,{ok:true,path:result.path,size:result.size,filename:path.basename(target)});}
+   if(req.method==="POST"&&url.pathname==="/backup/restore"){const body=await requestBody(req,64*1024);let data={};try{data=JSON.parse(body.toString("utf8"))}catch{throw new Error("Invalid restore request.");}const result=await restoreManagerBackup(String(data.name||""));return json(200,{ok:true,...result,message:`Backup ${String(data.name||"")} restored successfully. A safety backup was created first.`});}
    if(req.method==="POST"&&url.pathname==="/update/upload"){const body=await requestBody(req);await fsp.writeFile(UPDATE_ZIP,body);writeUpdateStatus({state:"uploaded",filename:req.headers["x-update-filename"]||"update.zip",size:body.length,message:"Update package uploaded. Validate it before installing."});return json(200,{ok:true,size:body.length,filename:req.headers["x-update-filename"]||"update.zip"});}
    if(req.method==="POST"&&url.pathname==="/update/validate"){const info=await validateIncomingUpdate();writeUpdateStatus({state:"validated",filename:path.basename(String(req.headers["x-update-filename"]||"incoming.zip")),newVersion:info.package.version,size:info.size,uncompressedSize:info.uncompressedSize,message:"Update package is valid and ready to install."});return json(200,{ok:true,version:info.package.version,size:info.size,uncompressedSize:info.uncompressedSize});}
    if(req.method==="POST"&&url.pathname==="/update/install"){const result=await beginInstallUpdate();return json(202,result);}
